@@ -77,10 +77,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "opentelemetry/common/key_value_iterable_view.h"
 #include "opentelemetry/common/timestamp.h"
 #include "opentelemetry/exporters/otlp/otlp_recordable.h"
 #include "opentelemetry/exporters/otlp/otlp_recordable_utils.h"
@@ -162,27 +164,136 @@ protected:
 constexpr std::size_t kBatchSmall = 1;    // single span
 constexpr std::size_t kBatchLarge = 512;  // default batch size
 
-// Build a batch of N fully-populated OtlpRecordable spans for PopulateRequest benchmarks.
+using AttributeIterable =
+    opentelemetry::common::KeyValueIterableView<std::vector<test_utils::SpanAttribute>>;
+
+std::unique_ptr<otlp::OtlpRecordable> MakeRecordable(
+    const std::vector<test_utils::SpanAttribute> &attributes,
+    std::size_t event_count,
+    std::size_t link_count,
+    opentelemetry::common::SystemTimestamp now)
+{
+  auto recordable = std::make_unique<otlp::OtlpRecordable>();
+  recordable->SetIdentity(test_utils::TestSpanContext(), opentelemetry::trace::SpanId{});
+  recordable->SetName("benchmark_span");
+  recordable->SetSpanKind(trace_api::SpanKind::kServer);
+  recordable->SetStartTime(now);
+  recordable->SetDuration(std::chrono::milliseconds(5));
+  recordable->SetResource(test_utils::TestResource());
+  recordable->SetInstrumentationScope(test_utils::TestScope());
+  for (const auto &attribute : attributes)
+  {
+    recordable->SetAttribute(attribute.first, attribute.second);
+  }
+  const AttributeIterable event_attributes{test_utils::SpanEventAttributes()};
+  for (std::size_t i = 0; i < event_count; ++i)
+  {
+    recordable->AddEvent("benchmark_event", now, event_attributes);
+  }
+  const AttributeIterable link_attributes{test_utils::SpanLinkAttributes()};
+  for (std::size_t i = 0; i < link_count; ++i)
+  {
+    recordable->AddLink(test_utils::TestSpanContext(), link_attributes);
+  }
+  return recordable;
+}
+
+// Build a batch of N fully-populated OtlpRecordable spans, each carrying `attribute_count`
+// attributes, for PopulateRequest benchmarks.
 std::vector<std::unique_ptr<opentelemetry::sdk::trace::Recordable>> MakeSpanBatch(
-    std::size_t span_count)
+    std::size_t span_count,
+    std::size_t attribute_count)
 {
   const auto now = opentelemetry::common::SystemTimestamp(std::chrono::system_clock::now());
+  const std::vector<test_utils::SpanAttribute> attributes =
+      test_utils::MakeAttributes(attribute_count);
 
   std::vector<std::unique_ptr<opentelemetry::sdk::trace::Recordable>> batch;
   batch.reserve(span_count);
   for (std::size_t span_idx = 0; span_idx < span_count; ++span_idx)
   {
-    auto recordable = std::make_unique<otlp::OtlpRecordable>();
-    recordable->SetIdentity(test_utils::TestSpanContext(), opentelemetry::trace::SpanId{});
-    recordable->SetName("benchmark_span");
-    recordable->SetSpanKind(trace_api::SpanKind::kServer);
-    recordable->SetStartTime(now);
-    recordable->SetDuration(std::chrono::milliseconds(5));
-    recordable->SetResource(test_utils::TestResource());
-    recordable->SetInstrumentationScope(test_utils::TestScope());
-    batch.push_back(std::move(recordable));
+    batch.push_back(MakeRecordable(attributes, 0, 0, now));
   }
   return batch;
+}
+
+// How many recordables the instrumented thread hands off before the queue is drained.
+// Used to amortize the benchmark timer's pause overhead.
+constexpr std::size_t kQueuedRecordables = 64;
+
+// Time recordable creation only to measure the cost of creating and populating a recordable
+// without the cost of destroying/exporting it.
+template <typename MakeRecordableFn>
+void RunRecordLoop(benchmark::State &state, MakeRecordableFn make_recordable)
+{
+  std::vector<std::unique_ptr<otlp::OtlpRecordable>> queued;
+  queued.reserve(kQueuedRecordables);
+
+  for (auto _ : state)
+  {
+    queued.push_back(make_recordable());
+    if (queued.size() == kQueuedRecordables)
+    {
+      state.PauseTiming();
+      queued.clear();
+      state.ResumeTiming();
+    }
+  }
+
+  state.SetItemsProcessed(state.iterations());
+}
+
+// Time reclaiming a queue of recorded spans. E.g., while exporting.
+template <typename MakeRecordableFn>
+void RunDestroyLoop(benchmark::State &state, MakeRecordableFn make_recordable)
+{
+  for (auto _ : state)
+  {
+    state.PauseTiming();
+    std::vector<std::unique_ptr<otlp::OtlpRecordable>> queued;
+    queued.reserve(kQueuedRecordables);
+    for (std::size_t i = 0; i < kQueuedRecordables; ++i)
+    {
+      queued.push_back(make_recordable());
+    }
+    state.ResumeTiming();
+
+    queued.clear();
+  }
+
+  state.SetItemsProcessed(state.iterations() * kQueuedRecordables);
+}
+
+// Reduced min runtime as the timed section in the Destroy* benchmarks is very small, and the wall
+// time is dominated by the setup/teardown of the queue, which does not count towards the measured
+// time, leading to very long wall times.
+constexpr double kDestroyMinTimeSeconds = 0.02;
+
+void AttributeArgs(benchmark::internal::Benchmark *benchmark)
+{
+  benchmark->ArgName("attribute_count")
+      ->Arg(1)
+      ->Arg(10)
+      ->Arg(test_utils::kSpanAttributeLimit)
+      ->Unit(benchmark::kNanosecond);
+}
+
+void EventArgs(benchmark::internal::Benchmark *benchmark)
+{
+  benchmark->ArgName("event_count")
+      ->Arg(1)
+      ->Arg(10)
+      ->Arg(test_utils::kSpanEventLimit)
+      ->Unit(benchmark::kNanosecond);
+}
+
+void LinkArgs(benchmark::internal::Benchmark *benchmark)
+{
+  benchmark->ArgName("link_count")
+      ->Arg(1)
+      ->Arg(10)
+      ->Arg(test_utils::kSpanLinkLimit)
+      ->Unit(benchmark::kNanosecond);
 }
 
 std::unique_ptr<google::protobuf::Arena> CreateArena()
@@ -293,12 +404,81 @@ BENCHMARK_REGISTER_F(OtlpRecordableFixture, RecordSpanWithLinks)
     ->Arg(test_utils::kSpanLinkLimit)
     ->Unit(benchmark::kNanosecond);
 
+//
+// Benchmark OTLP recordable in isolation without the tracer, exporter etc.
+//
+
+// Cost to instrumentation thread to create and populate a recordable with N values.
+static void BM_OtlpRecordableRecordAttributes(benchmark::State &state)
+{
+  const auto attributes = test_utils::MakeAttributes(static_cast<std::size_t>(state.range(0)));
+  const auto now        = opentelemetry::common::SystemTimestamp(std::chrono::system_clock::now());
+
+  RunRecordLoop(state, [&] { return MakeRecordable(attributes, 0, 0, now); });
+}
+BENCHMARK(BM_OtlpRecordableRecordAttributes)->Apply(AttributeArgs);
+
+static void BM_OtlpRecordableRecordEvents(benchmark::State &state)
+{
+  const auto event_count = static_cast<std::size_t>(state.range(0));
+  const auto now         = opentelemetry::common::SystemTimestamp(std::chrono::system_clock::now());
+  static const std::vector<test_utils::SpanAttribute> kNoAttributes;
+
+  RunRecordLoop(state, [&] { return MakeRecordable(kNoAttributes, event_count, 0, now); });
+}
+BENCHMARK(BM_OtlpRecordableRecordEvents)->Apply(EventArgs);
+
+static void BM_OtlpRecordableRecordLinks(benchmark::State &state)
+{
+  const auto link_count = static_cast<std::size_t>(state.range(0));
+  const auto now        = opentelemetry::common::SystemTimestamp(std::chrono::system_clock::now());
+  static const std::vector<test_utils::SpanAttribute> kNoAttributes;
+
+  RunRecordLoop(state, [&] { return MakeRecordable(kNoAttributes, 0, link_count, now); });
+}
+BENCHMARK(BM_OtlpRecordableRecordLinks)->Apply(LinkArgs);
+
+// Cost to exporter thread to reclaim a recordable with N values.
+static void BM_OtlpRecordableDestroyAttributes(benchmark::State &state)
+{
+  const auto attributes = test_utils::MakeAttributes(static_cast<std::size_t>(state.range(0)));
+  const auto now        = opentelemetry::common::SystemTimestamp(std::chrono::system_clock::now());
+
+  RunDestroyLoop(state, [&] { return MakeRecordable(attributes, 0, 0, now); });
+}
+BENCHMARK(BM_OtlpRecordableDestroyAttributes)
+    ->Apply(AttributeArgs)
+    ->MinTime(kDestroyMinTimeSeconds);
+
+static void BM_OtlpRecordableDestroyEvents(benchmark::State &state)
+{
+  const auto event_count = static_cast<std::size_t>(state.range(0));
+  const auto now         = opentelemetry::common::SystemTimestamp(std::chrono::system_clock::now());
+  static const std::vector<test_utils::SpanAttribute> kNoAttributes;
+
+  RunDestroyLoop(state, [&] { return MakeRecordable(kNoAttributes, event_count, 0, now); });
+}
+BENCHMARK(BM_OtlpRecordableDestroyEvents)->Apply(EventArgs)->MinTime(kDestroyMinTimeSeconds);
+
+static void BM_OtlpRecordableDestroyLinks(benchmark::State &state)
+{
+  const auto link_count = static_cast<std::size_t>(state.range(0));
+  const auto now        = opentelemetry::common::SystemTimestamp(std::chrono::system_clock::now());
+  static const std::vector<test_utils::SpanAttribute> kNoAttributes;
+
+  RunDestroyLoop(state, [&] { return MakeRecordable(kNoAttributes, 0, link_count, now); });
+}
+BENCHMARK(BM_OtlpRecordableDestroyLinks)->Apply(LinkArgs)->MinTime(kDestroyMinTimeSeconds);
+
 // Benchmark the arena allocation + OtlpRecordableUtils::PopulateRequest for a
-// batch of N spans. This mirrors the path in OtlpGrpcExporter::Export.
+// batch of N spans, each carrying M attributes. This mirrors the path in
+// OtlpGrpcExporter::Export.
 static void BM_OtlpPopulateRequest(benchmark::State &state)
 {
-  const int64_t span_count = state.range(0);
-  auto batch               = MakeSpanBatch(static_cast<std::size_t>(span_count));
+  const int64_t span_count      = state.range(0);
+  const int64_t attribute_count = state.range(1);
+  auto batch                    = MakeSpanBatch(static_cast<std::size_t>(span_count),
+                                                static_cast<std::size_t>(attribute_count));
   for (auto _ : state)
   {
     auto arena    = CreateArena();
@@ -314,9 +494,11 @@ static void BM_OtlpPopulateRequest(benchmark::State &state)
   state.SetItemsProcessed(state.iterations() * span_count);
 }
 BENCHMARK(BM_OtlpPopulateRequest)
-    ->ArgName("span_count")
-    ->Arg(kBatchSmall)
-    ->Arg(kBatchLarge)
+    ->ArgNames({"span_count", "attribute_count"})
+    ->Args({kBatchSmall, 1})
+    ->Args({kBatchSmall, 10})
+    ->Args({kBatchLarge, 1})
+    ->Args({kBatchLarge, 10})
     ->Unit(benchmark::kMicrosecond);
 
 int main(int argc, char **argv)

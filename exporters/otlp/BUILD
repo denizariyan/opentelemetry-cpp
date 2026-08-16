@@ -47,6 +47,7 @@ cc_library(
         "src/otlp_recordable_utils.cc",
     ],
     hdrs = [
+        "include/opentelemetry/exporters/otlp/otlp_arena_utils.h",
         "include/opentelemetry/exporters/otlp/otlp_log_recordable.h",
         "include/opentelemetry/exporters/otlp/otlp_metric_utils.h",
         "include/opentelemetry/exporters/otlp/otlp_populate_attribute_utils.h",

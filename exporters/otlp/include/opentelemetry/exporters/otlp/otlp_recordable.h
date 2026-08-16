@@ -4,12 +4,14 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>  // For std::size_t
 #include <cstdint>  // For std::uint32_t
 #include <limits>   // For std::numeric_limits
 #include <string>
 
 // clang-format off
 #include "opentelemetry/exporters/otlp/protobuf_include_prefix.h" // IWYU pragma: keep
+#include "google/protobuf/arena.h"
 #include "opentelemetry/proto/common/v1/common.pb.h"
 #include "opentelemetry/proto/resource/v1/resource.pb.h"
 #include "opentelemetry/proto/trace/v1/trace.pb.h"
@@ -19,6 +21,7 @@
 #include "opentelemetry/common/attribute_value.h"
 #include "opentelemetry/common/key_value_iterable.h"
 #include "opentelemetry/common/timestamp.h"
+#include "opentelemetry/exporters/otlp/otlp_arena_utils.h"
 #include "opentelemetry/nostd/string_view.h"
 #include "opentelemetry/sdk/instrumentationscope/instrumentation_scope.h"
 #include "opentelemetry/sdk/resource/resource.h"
@@ -116,7 +119,23 @@ public:
                                    &instrumentation_scope) noexcept override;
 
 private:
-  proto::trace::v1::Span span_;
+  /**
+   * Size of the arena's first block, which lives inside the recordable rather than on the heap.
+   *
+   * Stored inline within the recordable to improve cache locality for small recordables.
+   */
+  static constexpr std::size_t kInlineArenaBytes = 1024;
+
+  /**
+   * Cap on the blocks the arena allocates once it outgrows the inline block.
+   */
+  static constexpr std::size_t kMaxArenaBlockBytes = 1024;
+
+  detail::InlineArenaBlock<kInlineArenaBytes> inline_arena_block_;
+  google::protobuf::Arena arena_{
+      detail::MakeArenaOptions(inline_arena_block_, kMaxArenaBlockBytes)};
+  proto::trace::v1::Span &span_ = *google::protobuf::Arena::Create<proto::trace::v1::Span>(&arena_);
+
   const opentelemetry::sdk::resource::Resource *resource_ = nullptr;
   const opentelemetry::sdk::instrumentationscope::InstrumentationScope *instrumentation_scope_ =
       nullptr;

@@ -201,6 +201,11 @@ Increment the:
   `AlwaysOff`/`TraceBased`)
   [#4267](https://github.com/open-telemetry/opentelemetry-cpp/pull/4267)
 
+* [EXPORTER] Reduce the time cost of both creating and destroying a recordable,
+  especially when it carries many attributes, events, or links at the cost of
+  increased memory usage for span storage.
+  [#3256](https://github.com/open-telemetry/opentelemetry-cpp/issues/3256)
+
 Important changes:
 
 * [API] Never set a null global provider or propagator
